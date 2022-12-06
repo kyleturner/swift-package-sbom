@@ -4,12 +4,12 @@ import CryptoKit
 
 import ArgumentParser
 
-import PackageModel
-import PackageLoading
+import Basics
 import PackageGraph
+import TSCBasic
 import Workspace
 
-import Git
+//import Git
 
 import CycloneDX
 
@@ -27,25 +27,11 @@ extension SwiftPackageSBOM {
         mutating func run() throws {
             var bom = BillOfMaterials(version: 1)
 
-            let swiftCompiler = try { () throws -> AbsolutePath in
-                let string: String
-                #if os(macOS)
-                string = try Process.checkNonZeroExit(args: "xcrun", "--sdk", "macosx", "-f", "swiftc").spm_chomp()
-                #else
-                string = try Process.checkNonZeroExit(args: "which", "swiftc").spm_chomp()
-                #endif
-                
-                return try AbsolutePath(validating: string)
-            }()
-
             // Load package information
-            let diagnostics = DiagnosticsEngine()
-            let manifest = try ManifestLoader.loadManifest(packagePath: packagePath, swiftCompiler: swiftCompiler, swiftCompilerFlags: [], packageKind: .local)
-            let loadedPackage = try PackageBuilder.loadPackage(packagePath: packagePath, swiftCompiler: swiftCompiler, swiftCompilerFlags: [], diagnostics: diagnostics)
-            let graph = try Workspace.loadGraph(packagePath: packagePath, swiftCompiler: swiftCompiler, swiftCompilerFlags: [], diagnostics: diagnostics)
+            let observability = ObservabilitySystem({ print("\($0): \($1)") })
+            let workspace = try Workspace(forRootPackage: packagePath)
 
-            // Attempt to load repository
-            let repository = try? Repository.discover(at: URL(fileURLWithPath: packagePath.pathString))
+            let graph = try workspace.loadPackageGraph(rootPath: packagePath, observabilityScope: observability.topScope)
 
             // Detect license files
             var licenses: [License] = []
@@ -72,19 +58,23 @@ extension SwiftPackageSBOM {
                     classification = .application
                 case .test:
                     continue
+                case .snippet:
+                    continue
+                case .plugin:
+                    continue
                 }
 
                 var component = Component(id: product.name, classification: classification)
                 component.licenses = licenses
 
                 // If the package root has a Git repository, record the latest commit
-                if let head = repository?.head?.commit {
-                    var commit = CycloneDX.Commit(id: head.id.description)
-                    commit.author = IdentifiableAction(timestamp: head.author.time, name: head.author.name, email: head.author.email)
-                    commit.committer = IdentifiableAction(timestamp: head.committer.time, name: head.committer.name, email: head.committer.email)
-                    commit.message = head.message?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    component.pedigree = Pedigree(commits: [commit])
-                }
+//                if let head = repository?.head?.commit {
+//                    var commit = CycloneDX.Commit(id: head.id.description)
+//                    commit.author = IdentifiableAction(timestamp: head.author.time, name: head.author.name, email: head.author.email)
+//                    commit.committer = IdentifiableAction(timestamp: head.committer.time, name: head.committer.name, email: head.committer.email)
+//                    commit.message = head.message?.trimmingCharacters(in: .whitespacesAndNewlines)
+//                    component.pedigree = Pedigree(commits: [commit])
+//                }
 
                 // Record each source file in the component
                 do {
@@ -100,16 +90,17 @@ extension SwiftPackageSBOM {
             }
 
             // Record dependency packages as components
-            for dependency in graph.requiredDependencies where dependency.kind == .remote {
-                var component = Component(id: dependency.name, classification: .library)
+            for dependency in graph.requiredDependencies {
+                if case .remoteSourceControl(let sourceURL) = dependency.kind {
+                    var component = Component(id: dependency.identity.description, classification: .library)
 
-                do {
-                    guard let url = URL(string: dependency.repository.url) else { break }
-                    let reference = ExternalReference(kind: .vcs, url: url)
-                    component.externalReferences.append(reference)
+                    do {
+                        let reference = ExternalReference(kind: .vcs, url: sourceURL)
+                        component.externalReferences.append(reference)
+                    }
+
+                    bom.components.append(component)
                 }
-
-                bom.components.append(component)
             }
 
             // Record dependencies
@@ -130,6 +121,7 @@ extension SwiftPackageSBOM {
 
 fileprivate extension Dependency {
     init(_ package: ResolvedPackage) {
-        self.init(reference: package.name, dependsOn: package.dependencies.map(Dependency.init))
+        self.init(reference: package.identity.description,
+                  dependsOn: package.dependencies.map(Dependency.init))
     }
 }
